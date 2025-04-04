@@ -1,9 +1,19 @@
+from collections import Counter
 from datetime import date
 from typing import List, Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import Boolean, Column, Date, ForeignKey, Integer, String, create_engine
+from sqlalchemy import (
+    Boolean,
+    Column,
+    Date,
+    ForeignKey,
+    Integer,
+    String,
+    create_engine,
+    func,
+)
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -73,6 +83,7 @@ class BorrowBook(BaseModel):
     return_date: date
 
 
+#  An Endpoint to create a record and insert at least 5 record into each table.
 @app.post("/books/")
 def create_book(book: BookCreate, db: Session = Depends(get_db)):
     db_books = Books(
@@ -106,46 +117,85 @@ def borrow_book(borrowedbook: BorrowBook, db: Session = Depends(get_db)):
         borrow_date=borrowedbook.borrow_date,
         return_date=borrowedbook.return_date,
     )
-    db.add(db_borrowedbooks)
-    db.commit()
-    db.refresh(db_borrowedbooks)
+
+    db_book_available = (
+        db.query(Books)
+        .filter(Books.id == borrowedbook.book_id, Books.available == True)
+        .first()
+    )
+    if db_book_available is None:
+        raise HTTPException(status_code=404, detail="Book not found")
+    else:
+        db_book_available.available = False
+        db.add(db_borrowedbooks)
+        db.commit()
+        db.refresh(db_borrowedbooks)
     return {"message": f"Book: {borrowedbook.book_id} has succesfully been borrowed"}
 
 
+# an endpoint to retrieve all books that are currently available for borrowing. change judge from the availability
 @app.get("/availablebooks")
 def available_books(db: Session = Depends(get_db)):
-    borrowed_books = db.query(BorrowedBooks.book_id).all()
-    borrowed_books = {id_tuple[0] for id_tuple in borrowed_books}
-    availablebooks = db.query(Books).filter(Books.id.notin_(borrowed_books)).all()
+    availablebooks = db.query(Books).filter(Books.available == True).all()
     return availablebooks
 
 
+# Retrieve a list of members who have borrowed at least 2 books. Add the member's ID to the output
 @app.get("/membersborrowed")
 def members_borrowed(db: Session = Depends(get_db)):
-    members_borrowedID = db.query(BorrowedBooks.member_id).all()
-    members_borrowedID = {idTuple[0] for idTuple in members_borrowedID}
     members_borrowed = (
-        db.query(Members).filter(Members.id.in_(members_borrowedID)).all()
+        db.query(
+            BorrowedBooks.member_id, func.count(BorrowedBooks.member_id).label("count")
+        )
+        .group_by(BorrowedBooks.member_id)
+        .having(func.count(BorrowedBooks.member_id) > 1)
+        .order_by(func.count(BorrowedBooks.member_id).desc())
+        .all()
     )
-    return members_borrowed
+
+    members_borrowed = {id_tuple[0] for id_tuple in members_borrowed}
+    borrowed_atleast2 = db.query(Members).filter(Members.id.in_(members_borrowed)).all()
+
+    return borrowed_atleast2
 
 
-@app.delete(
-    "/books"
-)  # to delete all books that were published before the year 2000 and have never been borrowed.
+#  To find the most borrowed book)
+@app.get("/borrowedbooks")
+def most_borrowed_books(db: Session = Depends(get_db)):
+    db_borrowedbooks = db.query(BorrowedBooks.book_id).all()
+    db_borrowedbooks = {id_tuple[0] for id_tuple in db_borrowedbooks}
+
+    db_books = (
+        db.query(Books.title, func.count(Books.title).label("count"))
+        .filter(Books.id.in_(db_borrowedbooks))
+        .group_by(Books.title)
+        .order_by(func.count(Books.title).desc())
+        .first()
+    )
+
+    if not db_books:
+        return {"message": "No items found"}
+    book_details = db.query(Books).filter(Books.title == db_books[0]).first()
+
+    return book_details
+
+
+# to delete all books that were published before the year 2000 and have never been borrowed.
+@app.delete("/books")
 def delete_books(db: Session = Depends(get_db)):
     db_Oldbook = db.query(Books).filter(Books.published_year < 2000).all()
-    borrowed_books = db.query(BorrowedBooks.book_id).all()
-    borrowed_books = {id_tuple[0] for id_tuple in borrowed_books}
+    db_borrowed_books = db.query(BorrowedBooks.book_id).all()
+    db_borrowed_books = {id_tuple[0] for id_tuple in db_borrowed_books}
 
     for book in db_Oldbook:
-        if book.id not in borrowed_books:
+        if book.id not in db_borrowed_books:
             db.delete(book)
 
     db.commit()
     return db_Oldbook
 
 
+# Delete a member but ensure all their borrowed records are also deleted to maintain referential integrity.
 @app.delete("/members/{member_id}")
 def delete_member(member_id: int, db: Session = Depends(get_db)):
     member = db.query(Members).filter(Members.id == member_id).first()
